@@ -29,7 +29,6 @@
       (__/   \__)
 ```
 
-
 # Cinder — EMBER2024 Malware Detection
 
 A machine-learning classifier for the **Cinder** challenge: given static features of
@@ -95,7 +94,7 @@ so the metadata physically cannot enter the model.
    the pipeline reports **both** PR-AUC and **TPR@{1e-2, 1e-3, 1e-4}** at every slice.
    Get ranking right first; calibrate and pick the threshold last, as a separate step.
 
-2. **Temporal validation.** We hold out the latest weeks of the training set
+2. **Temporal validation.** I hold out the latest weeks of the training set
    (`VALID_WEEKS`, default 8) to mirror the real train→test gap. Random k-fold would leak
    the future into the past and produce a CV number that collapses on the true test set.
 
@@ -107,7 +106,7 @@ so the metadata physically cannot enter the model.
    resampling is irrelevant. Effort goes to the drift tail and the low-FPR operating point.
 
 5. **Slice auditing.** Aggregate PR-AUC can look excellent while the model whiffs on the
-   newest weeks or the evasive tail. We slice validation by time and by architecture
+   newest weeks or the evasive tail. I slice validation by time and by architecture
    (win32/win64), with a novel-family (TLSH-clustered) slice planned.
 
 ---
@@ -125,13 +124,13 @@ so the metadata physically cannot enter the model.
 ## Setup
 
 `thrember`'s dependency chain (`signify` → `oscrypto`) commonly fails to install on
-modern OpenSSL / Colab. We **stub `signify`** in `cinder_ember.py` because we vectorize
+modern OpenSSL / Colab. I **stub `signify`** in `cinder_ember.py` because I vectorize
 *pre-extracted* features — signatures are never parsed from raw bytes — so the native
 stack is not needed.
 
 ```bash
-pip install lightgbm pefile numpy polars scikit-learn tqdm
-pip install "git+https://github.com/FutureComputing4AI/EMBER2024.git" --no-deps
+uv pip install lightgbm pefile numpy polars scikit-learn tqdm
+uv pip install "git+https://github.com/FutureComputing4AI/EMBER2024.git" --no-deps
 ```
 
 ---
@@ -140,17 +139,17 @@ pip install "git+https://github.com/FutureComputing4AI/EMBER2024.git" --no-deps
 
 ```bash
 # 1. Inspect a data folder (always do this first on new data)
-python inspect_schema.py --train ../../data/train
+uv run python inspect_schema.py --train ../../data/train
 
 # 2. Vectorize raw features into per-shard .npz caches (restartable; ~670 MB/shard)
-python cinder_ember.py vectorize --data ../../data/train --cache cache/train
-python cinder_ember.py vectorize --data ../../data/eval  --cache cache/eval
+uv run python cinder_ember.py vectorize --data ../../data/train --cache cache/train
+uv run python cinder_ember.py vectorize --data ../../data/eval  --cache cache/eval
 
 # 3. Train (subsample for fast iteration; drop --max-rows for final full-data runs)
-python cinder_ember.py train --cache cache/train --max-rows 800000
+uv run python cinder_ember.py train --cache cache/train --max-rows 800000
 
 # 4. Evaluate + write submission (joins external labels by sha256 if needed)
-python cinder_ember.py eval --cache cache/eval --labels ../../data/eval/labels.jsonl.gz
+uv run python cinder_ember.py eval --cache cache/eval --labels ../../data/eval/labels.jsonl.gz
 ```
 
 ### Compute notes
