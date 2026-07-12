@@ -23,6 +23,12 @@ from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
 
 VALID_WEEKS = 8
 
+def _group_ranges(ex):
+    r, i = {}, 0
+    for fe in ex.features:
+        r[fe.name] = (i, i + fe.dim); i += fe.dim
+    return r
+
 def tpr_at(y, s, t):
     fpr, tpr, _ = roc_curve(y, s); return float(np.interp(t, fpr, tpr))
 
@@ -57,6 +63,8 @@ def main():
     ap.add_argument("--target-rows", type=int, default=700000); ap.add_argument("--out", default="cinder_lgbm.txt")
     ap.add_argument("--formats", default="", help="comma list to keep, e.g. Win32,Win64,Dot_Net (default: all)")
     ap.add_argument("--rounds", type=int, default=2500); ap.add_argument("--leaves", type=int, default=200)
+    ap.add_argument("--drop-groups", default="", help="comma list of feature groups to zero out, "
+                    "e.g. authenticode,header (kept in sync with inference via cinder_drop_groups.txt)")
     args = ap.parse_args()
 
     X, y, wk, ft = load_subsampled(args.cache, args.target_rows)
@@ -65,6 +73,14 @@ def main():
         m = np.isin(ft, list(keep_ft))
         X, y, wk, ft = X[m], y[m], wk[m], ft[m]
         print(f"format filter {sorted(keep_ft)}: kept {m.sum():,} rows")
+    if args.drop_groups:
+        gr = _group_ranges(PEFeatureExtractor())
+        drop = [g.strip() for g in args.drop_groups.split(",") if g.strip()]
+        for g in drop:
+            a, b = gr[g]; X[:, a:b] = 0.0
+        Path("cinder_drop_groups.txt").write_text("\n".join(drop) + "\n")
+        print(f"DROPPED groups (zeroed, train+inference): {drop}  -> wrote cinder_drop_groups.txt "
+              f"(bundle this next to solution.py)")
     uniq = np.unique(wk[wk >= 0]); cut = uniq[-VALID_WEEKS]
     tr, va = wk < cut, wk >= cut
     print(f"temporal split: train weeks {uniq[0]}..{cut-1} (n={tr.sum():,}), "
@@ -93,6 +109,10 @@ def main():
     ex = PEFeatureExtractor()
     recs = list(read_jsonl(args.shard))
     Xe = np.vstack([_safe(ex, r) for r in recs]).astype(np.float32)
+    if args.drop_groups:
+        gr = _group_ranges(ex)
+        for g in [g.strip() for g in args.drop_groups.split(",") if g.strip()]:
+            a, b = gr[g]; Xe[:, a:b] = 0.0
     fte = np.array([str(r.get("file_type")) for r in recs])
     se = model.predict(Xe)
     print(f"\n=== EVAL score distribution from THIS fresh model (n={len(recs)}) ===")

@@ -39,6 +39,24 @@ _DIM = _EX.dim
 _PE_TYPES = frozenset({"Win32", "Win64", "Dot_Net"})
 NONPE_SCORE = 0.0
 
+# Optional: zero out feature groups the model was trained without (kept in sync via this
+# sidecar written by train_and_probe.py --drop-groups). Lets us starve the model of fakeable
+# metadata (e.g. authenticode/header) that evasive malware exploits.
+def _group_ranges():
+    r, i = {}, 0
+    for fe in _EX.features:
+        r[fe.name] = (i, i + fe.dim); i += fe.dim
+    return r
+
+_DROP_RANGES = []
+_dropfile = _HERE / "cinder_drop_groups.txt"
+if _dropfile.exists():
+    _gr = _group_ranges()
+    for _line in _dropfile.read_text().split():
+        _line = _line.strip()
+        if _line in _gr:
+            _DROP_RANGES.append(_gr[_line])
+
 
 # ---- pure-numpy LightGBM text-model evaluator (matches lgb.predict exactly) ----
 def _load_lgb_txt(path):
@@ -152,7 +170,10 @@ def predict_malware(sample_paths: List[Path]) -> List[float]:
             vectors.append(v); is_pe.append(True)   # unknown format -> let the model decide
     if not vectors:
         return []
-    scores = _predict(np.vstack(vectors))
+    X = np.vstack(vectors)
+    for a, b in _DROP_RANGES:                    # zero groups the model was trained without
+        X[:, a:b] = 0.0
+    scores = _predict(X)
     if NONPE_SCORE is not None:
         scores = np.where(np.asarray(is_pe, dtype=bool), scores, NONPE_SCORE)
     return [float(x) for x in scores]

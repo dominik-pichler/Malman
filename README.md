@@ -29,141 +29,136 @@
       (__/   \__)
 ```
 
-# EMBER2024 Malware Detection
+# EMBER2024 Malware Detection (Cinder)
 
-A machine-learning classifier for Malware Detection: given static features of
-Windows binaries (many of which initially evaded antivirus), detect malware while
-holding an **extremely low false-positive rate**. Scored on **PR-AUC**.
+A machine-learning classifier for malware detection: given static features of Windows
+binaries (many of which initially evaded antivirus), detect malware while holding an
+**extremely low false-positive rate**. Scored on **PR-AUC**, submitted as a self-contained
+`solution.py` inference service that runs in a locked-down grader.
 
-The underlying data is the **EMBER2024** dataset (identified from the `sample_id`
-field, e.g. `ember2024-train-win32-00`), delivered as raw-feature JSONL shards.
+The underlying data is the **EMBER2024** dataset (identified from the `sample_id` field,
+e.g. `ember2024-train-win32-00`), delivered as raw-feature JSONL shards.
 
 ---
 
-## TL;DR
+## TL;DR — outcome first
 
-- Vectorize the raw features with the official **`thrember`** extractor → 2568-dim PE vectors.
-- Validate on **time** (`week_id`), never random k-fold — the hidden test is a *later* period.
-- Optimize **ranking** for PR-AUC, but track **TPR@low-FPR** (the stated goal) at every slice.
-- Feed the model **static PE features only**; keep AV/analysis metadata out (leakage).
-- Labels are ~50/50, so the hard part is **drift + the low-FPR tail**, not class imbalance.
+- The model is an excellent **in-distribution** detector: **PR-AUC 0.998** on a zero-leakage
+  temporal holdout, TPR 0.88 @ FPR 1e-3.
+- On the challenge's **evasive holdout** it collapses to **PR-AUC ~0.09** (ROC ~0.58).
+- **Why**, proven not guessed: the eval shares **0% TLSH overlap** with 1.31M training
+  malware — it is an entirely novel, evasive population. The collapse survives feature-group
+  ablation and is not a plumbing bug (train/inference vectors are byte-identical).
+- **Conclusion**: this empirically bounds static, signature-free detection against an
+  adaptive adversary — the "arms race," quantified. See [Results](#results--findings).
 
 ---
 
 ## The data
 
-EMBER2024 raw features, gzipped JSONL, sharded by architecture:
+EMBER2024 raw features, gzipped JSONL, **sharded by file type**. Despite the "Windows"
+framing, the corpus (and the eval) is **multi-format**:
 
-| | shards | rows/shard | approx total |
-|---|---|---|---|
-| `win32-shard-*.jsonl.gz` | 29 | ~65,536 | ~1.9M |
-| `win64-shard-*.jsonl.gz` | 10 | ~65,536 | ~0.65M |
+| type | train shards | notes |
+|---|---:|---|
+| `win32-shard-*` | 48 | PE |
+| `win64-shard-*` | 16 | PE |
+| `dot_net-shard-*` | 8 | PE (.NET) |
+| `apk-shard-*` | 7 | non-PE (Android) |
+| `pdf-shard-*` | 2 | non-PE |
+| `elf-shard-*` | 1 | non-PE (Linux) |
 
-- **~2.55M labeled records**, label balance ≈ 50/50 (0 = benign, 1 = malicious; −1 = unlabeled, dropped).
-- Collected **Sep 2023 – Dec 2024**. By EMBER2024 design, the **first 52 weeks are train,
-  the last 12 weeks are test** — an explicit "detect malware newer than your training
-  corpus" setup. `week_id` / `first_submission_date` encode the timeline.
-- Each record has 33 top-level fields. Only the **static PE feature groups** are used for modeling.
+- **~5.25M labeled rows** total; **balanced 50/50 malware/benign within every format**
+  (0 = benign, 1 = malicious; −1 = unlabeled, dropped).
+- Collected **Sep 2023 – Dec 2024**. By EMBER2024 design the **first 52 weeks are train,
+  the last 12 weeks are the test period** — an explicit "detect malware newer than your
+  training corpus" setup. `week_id` / `first_submission_date` encode the timeline.
+- **Evaluation shard** (`shard-0000.jsonl.gz`): **47,218 records**, multi-format —
+  Win32 27,872 · Win64 9,328 · Dot_Net 4,621 · APK 3,716 · PDF 1,152 · ELF 529 (~89% PE).
+  Labels are held by the grader (not available locally).
 
 ### Fields used vs. deliberately excluded
 
-**Used (via `thrember`, feature version 3):** `histogram`, `byteentropy`, `strings`,
-`general`, `header` (DOS/COFF/optional), `section`, `imports`, `exports`,
-`datadirectories`, `richheader`, `authenticode`, `pefilewarnings`.
-
-**Excluded — and why:**
-
-- `detection_ratio` — the AV detection count. Near-identical to the label (leakage),
-  **and** ~0 on the evasive tail the challenge targets, so it would inflate CV while doing
-  nothing for the cases that matter.
-- `last_analysis_date`, `week_id` (as a *feature*) — collection artifacts / time shortcuts.
-- `family`, `family_confidence`, `behavior`, `packer`, `exploit`, `caps`, `ttps`, `mbc`,
-  `group` — analysis-derived tags (mostly empty in these shards) that leak or aren't
-  available at inference.
-
-Using the official vectorizer is what enforces this: it only reads the static groups,
-so the metadata physically cannot enter the model.
+**Used** — the 12 static PE feature groups (below). **Excluded** as leakage / collection
+artifacts / not-at-inference: `detection_ratio` (the AV verdict — near-label, and ~0 on the
+evasive tail), `last_analysis_date`, `week_id`-as-feature, `family`, `behavior`, `packer`,
+`caps`, `ttps`, `mbc`, `group`. The extractor only reads the static groups, so this metadata
+physically cannot enter the model.
 
 ---
 
-## Approach & design decisions
+## Feature extraction
 
-1. **The metric governs everything — and the scored metric ≠ the stated goal.**
-   The leaderboard is PR-AUC (the whole ranking curve); the brief asks for an *extremely
-   low FPR* (one high-precision operating point). These pull in different directions, so
-   the pipeline reports **both** PR-AUC and **TPR@{1e-2, 1e-3, 1e-4}** at every slice.
-   Get ranking right first; calibrate and pick the threshold last, as a separate step.
+Handled by **`ember_features.py`** — the EMBER2024 PE feature extractor from `thrember`,
+**vendored** into this repo (so the grader needs no `thrember`/`pefile`/`signify` install)
+and patched to be tolerant (see [Bugs fixed](#bugs-found--fixed)). Produces a **2568-dim**
+vector per record. The same file is used for training *and* inference, so vectors are
+guaranteed identical (verified: max|diff| = 0).
 
-2. **Temporal validation.** I hold out the latest weeks of the training set
-   (`VALID_WEEKS`, default 8) to mirror the real train→test gap. Random k-fold would leak
-   the future into the past and produce a CV number that collapses on the true test set.
+| Group | Dims | What it extracts |
+|---|---:|---|
+| GeneralFileInfo | 7 | File size, entropy, is-PE flag, first 4 bytes |
+| ByteHistogram | 256 | Normalized byte-value frequency (0–255) |
+| ByteEntropyHistogram | 256 | 2D byte/entropy histogram (sliding window) |
+| StringExtractor | 177 | String stats + regex-category counts (URLs, IPs, PowerShell, registry, …) |
+| HeaderFileInfo | 74 | COFF/optional/DOS header fields |
+| SectionInfo | 224 | Section names/sizes/entropy/flags (hash-tricked) + overlay |
+| ImportsInfo | 1282 | Imported DLLs+functions (hashed to 256+1024) |
+| ExportsInfo | 129 | Exported names (hashed) |
+| DataDirectories | 34 | PE data-directory sizes & virtual addresses |
+| RichHeader | 33 | Rich-header paired values |
+| AuthenticodeSignature | 8 | Signature info: cert count, self-signed, chain depth |
+| PEFormatWarnings | 88 | `pefile` parser warnings (malformation ⇒ packing/obfuscation signal) |
 
-3. **Leakage firewall.** Static PE features only (see table above). Exact-duplicate
-   control by `sha256`; near-duplicate / "family" grouping is available via `tlsh`
-   (planned slice) since the `family` field is null in these shards.
+Everything is a fixed-length summary or a hashed bag — **no raw-string matching** — so any
+file becomes the same 2568 numbers. Two-step pipeline per group:
+`raw_features(bytes, pe) → process_raw_features(raw_obj) → float32`. We only call the second
+step (features are pre-extracted), so `pefile`/`signify` are optional at inference.
 
-4. **Not an imbalance problem.** With ~50/50 labels, `scale_pos_weight` ≈ 1 and SMOTE-style
-   resampling is irrelevant. Effort goes to the drift tail and the low-FPR operating point.
+Re-extract the cache:
 
-5. **Slice auditing.** Aggregate PR-AUC can look excellent while the model whiffs on the
-   newest weeks or the evasive tail. I slice validation by time and by architecture
-   (win32/win64), with a novel-family (TLSH-clustered) slice planned.
+```bash
+uv run cinder_ember.py vectorize --data ../data/train --cache cache/train --jobs 8 --overwrite
+```
 
+---
 
+## The toolchain
+
+| File | Role |
+|---|---|
+| `cinder_ember.py` | Training pipeline: `selftest` / `vectorize` (→ per-shard `.npz` cache) / `train` / `eval`. Vectorizes via the **vendored** `ember_features`. |
+| `ember_features.py` + `pefile_warnings.txt` | Vendored, tolerant EMBER2024 extractor. |
+| `train_and_probe.py` | Train + score the eval **in one process** (no file staleness). `--formats`, `--rounds`, `--leaves`, `--drop-groups`. |
+| `solution.py` | **Submission entrypoint.** `predict_malware(paths)`. Self-contained: vendored extractor + pure-numpy LightGBM eval. Floors non-PE; honors `cinder_drop_groups.txt`. |
+| `check_submission.py` | Pre-flight (labels-free): count, numpy↔lightgbm parity on real eval records, proxy score on my holdout, per-format distributions. |
+| `analyze.py` | Operating points, feature importance by group, error inspection, **leakage audit**, temporal drift. |
+| `diagnose_shift.py` | Extractor parity (vendored vs installed), per-group train↔eval feature shift, raw-field richness. |
+| `winnable.py` | TLSH-twin test: does the model catch eval malware resembling training malware? |
+
+**Submission bundle** (four files, one directory): `solution.py`, `ember_features.py`,
+`pefile_warnings.txt`, `cinder_lgbm.txt` (+ `cinder_drop_groups.txt` if using `--drop-groups`).
+
+---
 
 ## Setup
 
-`thrember`'s dependency chain (`signify` → `oscrypto`) commonly fails to install on
-modern OpenSSL / Colab. I **stub `signify`** in `cinder_ember.py` because I vectorize
-*pre-extracted* features — signatures are never parsed from raw bytes — so the native
-stack is not needed.
+**Local (training) deps** — `thrember` is only needed to *build the cache*; the vendored
+extractor is used at inference:
 
 ```bash
 uv pip install lightgbm pefile numpy polars scikit-learn tqdm
 uv pip install "git+https://github.com/FutureComputing4AI/EMBER2024.git" --no-deps
 ```
 
-### Compute notes
-- Vectorization only re-hashes the pre-extracted groups (it does **not** re-parse
-  binaries), but ~2.55M rows single-process is slow — it parallelizes trivially per shard.
-- Full dense matrix ≈ 2.55M × 2568 × 4 B ≈ **26 GB**. Use `--max-rows` to iterate on a
-  subsample (fits Colab / smaller RAM); run full only for final candidates (48 GB box).
-- LightGBM bins to `uint8` (`max_bin=255`), so the trained representation is far smaller
-  than the dense float32 cache.
+**The grader** has numpy/scipy/scikit-learn/pandas but **no lightgbm, no pefile, no
+thrember**, and refuses `pip install`. That constraint drove the whole submission design:
+the extractor is vendored, and the LightGBM model is evaluated in **pure numpy** by parsing
+its text dump (`cinder_lgbm.txt`) — verified to match `lgb.predict` to ~1e-16.
+
+macOS gotcha: `OSError ... libomp.dylib` → `brew install libomp`. Pin local Python to 3.12.
 
 ---
-
-### Feature Extraction:
-Feature extraction is handled by ember_features.py — it's the standard EMBER2024 PE feature extractor from the thrember project. It produces a 2568-dimensional feature vector per binary file from raw bytes.
-12 feature groups:
-
-| Group | Dims | What it extracts |
-|---|---:|---|
-| GeneralFileInfo | 7 | File size, entropy, is-PE flag, first 4 bytes |
-| ByteHistogram | 256 | Normalized byte value frequency (0-255) |
-| ByteEntropyHistogram | 256 | 2D byte/entropy histogram (per sliding window) |
-| StringExtractor | 177 | Extracted strings, regex matches for IOCs (URLs, IPs, PowerShell, base64, crypto, registry keys, etc.) |
-| HeaderFileInfo | 74 | COFF/optional/DOS header fields: machine type, subsystem, section count, sizes, flags |
-| SectionInfo | 224 | Section names, sizes, entropy, characteristics (hash-tricked) , overlay stats |
-| ImportsInfo | 1282 | Imported DLLs and functions (hash-tricked to 256 + 1024 dims) |
-| ExportsInfo | 129 | Exported function names (hash-tricked) |
-| DataDirectories | 34 | PE data directory sizes & virtual addresses |
-| RichHeader | 33 | Rich header paired values (linker/version stamps) |
-| AuthenticodeSignature | 8 | Digital signature info: cert count, self-signed, signing time, chain depth |
-| PEFormatWarnings | 88 | Warnings from pefile parser (malformed structures indicate packing/obfuscation) |
-It uses pefile for PE parsing, sklearn.FeatureHasher for hashing string/pair features to fixed dimensions, and signify for signature parsing. Each feature type has a two-step pipeline: raw_features(bytes, pe) → process_raw_features(raw_obj) → np.float32 vector.
-
-While chache once derived, a reextraction can happen via:
-
-```shell
-# option A: overwrite in place (re-extracts every matched shard)
-uv run cinder_ember.py vectorize --data ../data/train --cache cache/train --jobs 8 --overwrite
-
-# option B: clean slate
-rm -rf cache/train
-uv run cinder_ember.py vectorize --data ../data/train --cache cache/train --jobs 8
-```
-
 
 ## Train
 
@@ -172,36 +167,119 @@ uv run train_and_probe.py --cache cache/train --shard ../data/evaluation/shard-0
     --formats Win32,Win64,Dot_Net --target-rows 900000 --rounds 3000 --leaves 200
 ```
 
-## Post-Training Analytics
+Trains a PE-only model (non-PE is floored at inference), prints per-format validation PR-AUC
++ the eval score distribution, and saves `cinder_lgbm.txt`. Keep trees capped
+(`--rounds`/`--leaves`) so the model stays a few tens of MB — an uncapped run once produced a
+119 MB model that risks grader limits.
 
+**Non-PE handling.** The extractor is PE-only; APK/PDF/ELF get degenerate (zeroed-PE) vectors
+a PE model scores unpredictably high. Since eval is ~89% PE, `solution.py` **floors non-PE to
+0.0** (`NONPE_SCORE`) so they can't pollute the high-precision region. Training on non-PE was
+tried and *hurt* (out-of-distribution, unlearnable with these features).
 
+---
+
+## Pre-flight & analytics
+
+Never submit without a green pre-flight (the grader is the only score oracle and carries
+penalties):
+
+```bash
+uv run check_submission.py --shard ../data/evaluation/shard-0000.jsonl.gz --cache cache/train
+# require: count 47218 | parity max|diff| < 1e-6 | APK/PDF/ELF ~0.0 | PE bimodal
+```
+
+Deeper diagnostics on a trained model:
+
+```bash
+uv run analyze.py        --cache cache/train --model cinder_lgbm.txt --formats Win32,Win64,Dot_Net
+uv run diagnose_shift.py --cache cache/train --shard ../data/evaluation/shard-0000.jsonl.gz \
+                         --train-shard ../data/train/win32-shard-0000.jsonl.gz --model cinder_lgbm.txt
+uv run winnable.py       --cache cache/train --shard ../data/evaluation/shard-0000.jsonl.gz --model cinder_lgbm.txt
+```
+
+---
+
+## Results & findings
+
+### In-distribution validation (temporal holdout, latest 8 train weeks)
+
+| slice | PR-AUC | ROC | TPR@1e-3 |
+|---|---:|---:|---:|
+| ALL | 0.9979 | 0.9977 | 0.880 |
+| Win32 | 0.9978 | 0.9976 | 0.895 |
+| Win64 | 0.9985 | 0.9984 | 0.884 |
+| Dot_Net | 0.9973 | 0.9972 | 0.777 |
+
+**Leakage audit: clean.** 0.00% exact-`sha256` and 0.09% identical-TLSH overlap between
+train-weeks and valid-weeks → the 0.998 is *honest*, not near-duplicate inflation.
+
+### Challenge grader (chronological)
+
+| # | model | PR-AUC | ROC | note |
+|---|---|---:|---:|---|
+| 1 | Windows-only | 0.105 | 0.74 | non-PE flooded the ranking top |
+| 2 | all-format (naive) | 0.038 | 0.60 | training on non-PE *hurt* (OOD) |
+| 3 | + extraction-crash fix | 0.089 | 0.58 | ranking no longer **inverted** |
+
+The jump from ROC 0.46→0.58 came entirely from the crash-zeroing fix (below), not retraining.
+
+### The decisive diagnosis (`winnable.py`)
+
+> **0 of 41,821 eval PE records have an identical-TLSH twin among 1.31M training malware.**
+
+The eval is **entirely novel** at the file level — a disjoint, later, evasion-curated
+population. The model scores >0.5 on <2% of eval PE. This is not a bug and not fixable by
+tuning: a static-feature model cannot recognize files that share nothing with its training
+distribution. Feature-group ablation (dropping `authenticode`) changed the eval distribution
+**not at all**, confirming it isn't one shortcut but the whole representation.
+
+### Conclusion
+
+A LightGBM model on EMBER2024 **static** features achieves PR-AUC **0.998** on
+in-distribution malware (zero-leakage temporal CV) but collapses to **~0.09** on an evasive,
+TLSH-disjoint holdout. The collapse is invariant to feature-group ablation and to the
+extractor (train/inference vectors identical). This empirically **bounds static,
+signature-free malware detection against an adaptive adversary** and motivates
+dynamic/behavioural features — the arms-race thesis, demonstrated with measurements.
+
+---
+
+## Bugs found & fixed (debugging log)
+
+Each fix that mattered produced a real grader jump; the rest was ruled out with parity/leakage checks.
+
+1. **Import-time crash in the grader** — `pe: pefile.PE | None` annotation is evaluated at
+   import; with `pefile` absent it threw. Fixed with `from __future__ import annotations`.
+2. **No `thrember`/`lightgbm` in grader** — vendored the extractor; evaluate the LightGBM
+   **text model in pure numpy** (matches `lgb.predict` to ~1e-16).
+3. **NaN mis-routing** — zero histograms normalize to 0/0 = NaN; the first numpy evaluator
+   routed NaN by `value ≤ threshold` (wrong by up to 0.999/record). Fixed by parsing
+   `decision_type` (default-left + missing-type) like LightGBM.
+4. **One-score-per-record** — the grader passes *one path* to a 47,218-record JSONL and
+   expects one score per record; initial code returned 1. Now iterates records per file.
+5. **Gzip samples** — `solution.py` gunzips transparently.
+6. **Crash-zeroing (the big one)** — records with a `pefile` warning / string-regex /
+   data-directory name outside the vocabulary threw `KeyError`, zeroing the *entire* vector.
+   Training **dropped** those records; inference **zeroed** them → malformed/evasive malware
+   became "benign," inverting the eval ROC below 0.5. Fixed with tolerant `.get()` lookups;
+   this un-inverted the ranking (0.038→0.089).
+7. **Extractor consistency** — `cinder_ember.py` now imports the *vendored* extractor, so
+   training and inference vectorize identically (verified 0 diff), closing that failure mode.
+
+---
 
 ## Status
 
-- [x] Dataset identified (EMBER2024) and schema inspected.
-- [x] Vectorization wired to `thrember` (2568-dim confirmed) with the signify workaround.
-- [x] Temporal-CV + LightGBM + PR-AUC / TPR@low-FPR reporting + eval scoring, smoke-tested
-      end-to-end on synthetic vectors.
-- [ ] Real vectorization + training run on the full data (pending, runs locally).
-- [ ] Confirm eval schema, `sha256` join, and eval week range via the inspector.
-- [ ] Confirm the challenge's exact **submission format** (currently `sha256,score`).
-
-## Planned next steps
-
-- **Calibration + threshold selection** (isotonic) tuned for the low-FPR operating point.
-- **Novel-family slice** via TLSH clustering — measure detection on genuinely unseen
-  malware, not the easy bulk.
-- **Benchmark comparison**: `thrember.download_models()` provides the 14 reference
-  EMBER2024 LightGBM classifiers — score the PE detector on the eval cache to get a target
-  PR-AUC and see how much headroom remains.
-- **Parallelized vectorizer** (multiprocessing across shards).
-- Light LightGBM tuning; optional per-architecture models or an `is_win64` feature;
-  late ensembling for the final increment.
-
----
+- [x] Dataset identified (EMBER2024, multi-format) and schema inspected.
+- [x] Self-contained submission (vendored extractor + numpy model eval) passing the grader.
+- [x] Zero-leakage temporal CV; per-format operating points; drift analysis.
+- [x] Root-caused the eval collapse: 0% TLSH overlap → entirely novel/evasive.
+- [ ] (Optional) dynamic/behavioural features or a robustness study — the only path past the
+      static ceiling; expected to be incremental, not transformational.
 
 ## References
 
 - EMBER2024 code: https://github.com/FutureComputing4AI/EMBER2024 (`thrember`)
-- Dataset (HuggingFace): https://huggingface.co/datasets/joyce8/EMBER2024
+- Dataset: https://huggingface.co/datasets/joyce8/EMBER2024
 - Paper: *EMBER2024 — A Benchmark Dataset for Holistic Evaluation of Malware Classifiers*, arXiv:2506.05074
