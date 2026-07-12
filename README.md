@@ -29,9 +29,9 @@
       (__/   \__)
 ```
 
-# Cinder — EMBER2024 Malware Detection
+# EMBER2024 Malware Detection
 
-A machine-learning classifier for the **Cinder** challenge: given static features of
+A machine-learning classifier for Malware Detection: given static features of
 Windows binaries (many of which initially evaded antivirus), detect malware while
 holding an **extremely low false-positive rate**. Scored on **PR-AUC**.
 
@@ -109,17 +109,7 @@ so the metadata physically cannot enter the model.
    newest weeks or the evasive tail. I slice validation by time and by architecture
    (win32/win64), with a novel-family (TLSH-clustered) slice planned.
 
----
 
-## Repository files
-
-| File | Purpose |
-|---|---|
-| `inspect_schema.py` | Stdlib-only schema inspector for the JSONL shards: keys/types, label balance, time range, join key. Run first on any new folder. |
-| `cinder_ember.py` | Main pipeline: `vectorize` (thrember → per-shard `.npz` cache), `train` (temporal split + LightGBM + slice metrics), `eval` (score eval shard, join labels, write submission). |
-| `cinder_baseline.py` | Format-agnostic imbalanced-detection scaffold (dedup, temporal/novel-family CV, calibration). Kept as a generic reference; `cinder_ember.py` is the EMBER-specific instantiation. |
-
----
 
 ## Setup
 
@@ -133,25 +123,6 @@ uv pip install lightgbm pefile numpy polars scikit-learn tqdm
 uv pip install "git+https://github.com/FutureComputing4AI/EMBER2024.git" --no-deps
 ```
 
----
-
-## Usage
-
-```bash
-# 1. Inspect a data folder (always do this first on new data)
-uv run python inspect_schema.py --train ../../data/train
-
-# 2. Vectorize raw features into per-shard .npz caches (restartable; ~670 MB/shard)
-uv run python cinder_ember.py vectorize --data ../../data/train --cache cache/train
-uv run python cinder_ember.py vectorize --data ../../data/eval  --cache cache/eval
-
-# 3. Train (subsample for fast iteration; drop --max-rows for final full-data runs)
-uv run python cinder_ember.py train --cache cache/train --max-rows 800000
-
-# 4. Evaluate + write submission (joins external labels by sha256 if needed)
-uv run python cinder_ember.py eval --cache cache/eval --labels ../../data/eval/labels.jsonl.gz
-```
-
 ### Compute notes
 - Vectorization only re-hashes the pre-extracted groups (it does **not** re-parse
   binaries), but ~2.55M rows single-process is slow — it parallelizes trivially per shard.
@@ -161,6 +132,49 @@ uv run python cinder_ember.py eval --cache cache/eval --labels ../../data/eval/l
   than the dense float32 cache.
 
 ---
+
+### Feature Extraction:
+Feature extraction is handled by ember_features.py — it's the standard EMBER2024 PE feature extractor from the thrember project. It produces a 2568-dimensional feature vector per binary file from raw bytes.
+12 feature groups:
+
+| Group | Dims | What it extracts |
+|---|---:|---|
+| GeneralFileInfo | 7 | File size, entropy, is-PE flag, first 4 bytes |
+| ByteHistogram | 256 | Normalized byte value frequency (0-255) |
+| ByteEntropyHistogram | 256 | 2D byte/entropy histogram (per sliding window) |
+| StringExtractor | 177 | Extracted strings, regex matches for IOCs (URLs, IPs, PowerShell, base64, crypto, registry keys, etc.) |
+| HeaderFileInfo | 74 | COFF/optional/DOS header fields: machine type, subsystem, section count, sizes, flags |
+| SectionInfo | 224 | Section names, sizes, entropy, characteristics (hash-tricked) , overlay stats |
+| ImportsInfo | 1282 | Imported DLLs and functions (hash-tricked to 256 + 1024 dims) |
+| ExportsInfo | 129 | Exported function names (hash-tricked) |
+| DataDirectories | 34 | PE data directory sizes & virtual addresses |
+| RichHeader | 33 | Rich header paired values (linker/version stamps) |
+| AuthenticodeSignature | 8 | Digital signature info: cert count, self-signed, signing time, chain depth |
+| PEFormatWarnings | 88 | Warnings from pefile parser (malformed structures indicate packing/obfuscation) |
+It uses pefile for PE parsing, sklearn.FeatureHasher for hashing string/pair features to fixed dimensions, and signify for signature parsing. Each feature type has a two-step pipeline: raw_features(bytes, pe) → process_raw_features(raw_obj) → np.float32 vector.
+
+While chache once derived, a reextraction can happen via:
+
+```shell
+# option A: overwrite in place (re-extracts every matched shard)
+uv run cinder_ember.py vectorize --data ../data/train --cache cache/train --jobs 8 --overwrite
+
+# option B: clean slate
+rm -rf cache/train
+uv run cinder_ember.py vectorize --data ../data/train --cache cache/train --jobs 8
+```
+
+
+## Train
+
+```bash
+uv run train_and_probe.py --cache cache/train --shard ../data/evaluation/shard-0000.jsonl.gz \
+    --formats Win32,Win64,Dot_Net --target-rows 900000 --rounds 3000 --leaves 200
+```
+
+## Post-Training Analytics
+
+
 
 ## Status
 

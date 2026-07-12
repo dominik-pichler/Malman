@@ -24,8 +24,10 @@ Usage:
     uv run python cinder_ember.py train     --cache cache/train --max-rows 800000 --target-fpr 1e-3
     uv run python cinder_ember.py eval      --cache cache/eval  --labels ../../data/eval/labels.jsonl.gz
 
-Note: --data/train holds the full multi-format EMBER2024; the Cinder challenge scope is
-the Windows PE shards, so vectorize defaults to glob 'win*-shard-*.jsonl.gz' (Win32+Win64).
+Note: the eval set is multi-format (Win32/Win64/Dot_Net/APK/PDF/ELF), so training uses
+ALL types by default (glob '*-shard-*.jsonl.gz'). thrember has only a PE extractor; non-PE
+files still yield a valid 2568-dim vector (byte/entropy/string/general populate, PE-structural
+dims zero out). Per-file-type slices in train/eval show how each format scores.
 """
 from __future__ import annotations
 import argparse, glob, gzip, json, os, pickle, sys, types
@@ -93,9 +95,8 @@ def cmd_vectorize(args):
     paths = sorted(glob.glob(os.path.join(args.data, args.glob)))
     if not paths:
         sys.exit(f"no shards matched '{args.glob}' under {args.data}\n"
-                 "(this folder holds the full multi-format EMBER2024; the Cinder scope is "
-                 "the Windows PE shards -- default glob 'win*-shard-*.jsonl.gz'. For the eval "
-                 "folder pass e.g. --glob 'shard-*.jsonl.gz'.)")
+                 "(train default 'ALL types' is '*-shard-*.jsonl.gz'; for the eval folder "
+                 "pass --glob 'shard-*.jsonl.gz')")
     print(f"matched {len(paths)} shards for glob '{args.glob}'")
     jobs = []
     for p in paths:
@@ -125,27 +126,31 @@ def cmd_vectorize(args):
 
 
 def cmd_selftest(args):
-    """Vectorize the first real record from --data and report. Seconds, not hours."""
+    """Vectorize one record of EACH file type under --data and report. Seconds, not hours.
+    Catches any format-specific vectorization failure before the full run."""
     _init_worker()
     matches = sorted(glob.glob(os.path.join(args.data, args.glob)))
     if not matches:
         sys.exit(f"no shards matched '{args.glob}' under {args.data}")
-    p = matches[0]
-    r = next(iter_records(p))
-    ft = str(r.get(ARCH))
-    print(f"shard: {os.path.basename(p)}")
-    print(f"record keys: {len(r)}  | label={r.get(LABEL)}  week_id={r.get(WEEK)}  arch={ft}")
-    if ft not in ("Win32", "Win64", "Dot_Net"):
-        print(f"  !! WARNING: file_type '{ft}' is not a Windows PE. The PE extractor will "
-              f"zero-fill PE groups on it. Narrow --glob to win*-shard-*.jsonl.gz.")
-    try:
-        v = np.asarray(_EX.process_raw_features(r), dtype=np.float32)
-        print(f"OK: vectorized to {v.shape[0]} dims, finite={np.isfinite(v).all()}, "
-              f"nonzero={(v!=0).sum()}  -> thrember matches the data, safe to run `vectorize`")
-    except Exception as e:
-        import traceback; traceback.print_exc()
-        sys.exit(f"\nFAILED on a feature group -> {type(e).__name__}: {e}\n"
-                 "thrember version does not match this data. Paste this and I'll pin the right version.")
+    one_per_type = {}
+    for p in matches:
+        pre = os.path.basename(p).split("-shard-")[0]
+        one_per_type.setdefault(pre, p)
+    print(f"file types: {sorted(one_per_type)}")
+    ok = True
+    for pre, p in sorted(one_per_type.items()):
+        r = next(iter_records(p))
+        try:
+            v = np.asarray(_EX.process_raw_features(r), dtype=np.float32)
+            print(f"  {pre:9} (arch={r.get(ARCH)}): OK {v.shape[0]} dims, "
+                  f"finite={np.isfinite(v).all()}, nonzero={(v!=0).sum()}")
+        except Exception as e:
+            ok = False
+            print(f"  {pre:9}: FAILED -> {type(e).__name__}: {e}")
+    print("-> all types vectorize, safe to run `vectorize`" if ok
+          else "-> FIX the failing type before vectorizing (paste this to me)")
+    if not ok:
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------- cache loading
@@ -255,6 +260,9 @@ def cmd_eval(args):
     print(f"eval rows scored: {m.sum():,} of {len(y):,}")
     if m.any():
         report("EVAL", y[m], raw[m])
+        for ft in np.unique(meta[ARCH][m]):
+            fm = m & (meta[ARCH] == ft)
+            report(f"EVAL:{ft}", y[fm], raw[fm])
         if "target_fpr" in op:
             print(f"at train operating point (target FPR {op['target_fpr']:.0e}): "
                   f"TPR={tpr_at_fpr(y[m], raw[m], op['target_fpr']):.3f}")
@@ -270,9 +278,9 @@ def cmd_eval(args):
 def main():
     p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
     st = sub.add_parser("selftest"); st.add_argument("--data", required=True)
-    st.add_argument("--glob", default="win*-shard-*.jsonl.gz"); st.set_defaults(func=cmd_selftest)
+    st.add_argument("--glob", default="*-shard-*.jsonl.gz"); st.set_defaults(func=cmd_selftest)
     v = sub.add_parser("vectorize"); v.add_argument("--data", required=True); v.add_argument("--cache", required=True)
-    v.add_argument("--glob", default="win*-shard-*.jsonl.gz"); v.add_argument("--jobs", type=int, default=1)
+    v.add_argument("--glob", default="*-shard-*.jsonl.gz"); v.add_argument("--jobs", type=int, default=1)
     v.add_argument("--overwrite", action="store_true")
     v.set_defaults(func=cmd_vectorize)
     t = sub.add_parser("train"); t.add_argument("--cache", required=True); t.add_argument("--max-rows", type=int, default=None)
