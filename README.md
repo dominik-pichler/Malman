@@ -163,7 +163,7 @@ macOS gotcha: `OSError ... libomp.dylib` → `brew install libomp`. Pin local Py
 ## Train
 
 ```bash
-uv run train_and_probe.py --cache cache/train --shard ../data/evaluation/shard-0000.jsonl.gz \
+uv run train_reference.py --cache cache/train --shard ../data/evaluation/shard-0000.jsonl.gz \
     --formats Win32,Win64,Dot_Net --target-rows 900000 --rounds 3000 --leaves 200
 ```
 

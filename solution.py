@@ -37,7 +37,7 @@ _DIM = _EX.dim
 # PE predictions instead of polluting the high-precision region PR-AUC cares about.
 # Set NONPE_SCORE = None to disable and let the model score everything (A/B toggle).
 _PE_TYPES = frozenset({"Win32", "Win64", "Dot_Net"})
-NONPE_SCORE = 0.0
+NONPE_SCORE = None   # reference model scores non-PE itself; no floor
 
 # Optional: zero out feature groups the model was trained without (kept in sync via this
 # sidecar written by train_and_probe.py --drop-groups). Lets us starve the model of fakeable
